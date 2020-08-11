@@ -181,7 +181,7 @@ func TestTCPSegmentsSentIncrement(t *testing.T) {
 	}
 }
 
-func TestTCPResetsSentIncrement(t *testing.T) {
+func TestTCPResetst(t *testing.T) {
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
 	stats := c.Stack().Stats()
@@ -237,6 +237,49 @@ func TestTCPResetsSentIncrement(t *testing.T) {
 	}
 	if err := testutil.Poll(metricPollFn, 1*time.Second); err != nil {
 		t.Error(err)
+	}
+}
+
+// Just confirm that we don't get an ICMP DstUnreachable ICMP packet.
+func TestTCPResetsSentNoICMP(t *testing.T) {
+	c := context.New(t, defaultMTU)
+	defer c.Cleanup()
+	stats := c.Stack().Stats()
+	wq := &waiter.Queue{}
+	ep, err := c.Stack().NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, wq)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %s", err)
+	}
+
+	if err := ep.Bind(tcpip.FullAddress{Port: context.StackPort}); err != nil {
+		t.Fatalf("Bind failed: %s", err)
+	}
+
+	if err := ep.Listen(10); err != nil {
+		t.Fatalf("Listen failed: %s", err)
+	}
+
+	// Send a SYN request for a closed port. This should elicit an RST
+	// but NOT an ICMPv4 DstUnreachable packet.
+	iss := seqnum.Value(789)
+	c.SendPacket(nil, &context.Headers{
+		SrcPort: context.TestPort,
+		DstPort: context.StackPort + 666,
+		Flags:   header.TCPFlagSyn,
+		SeqNum:  iss,
+	})
+
+	// Receive whatever comes back
+	b := c.GetPacket()
+	ipHdr := header.IPv4(b)
+	if got, want := ipHdr.Protocol(), uint8(header.TCPProtocolNumber); got != want {
+		t.Errorf("unexpected protocol, got = %d, want = %d", got, want)
+	}
+
+	// Read outgoing ICMP stats and check no ICMP DstUnreachable was recorded.
+	sent := stats.ICMP.V4PacketsSent
+	if got, want := int(sent.DstUnreachable.Value()), 0; got != want {
+		t.Errorf("got ICMP DstUnreachable.Value() = %d, want = %d", got, want)
 	}
 }
 
