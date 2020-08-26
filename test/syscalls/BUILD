@@ -434,6 +434,10 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:proc_sys_net_ipv4_test",
+)
+
+syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:pselect_test",
 )
