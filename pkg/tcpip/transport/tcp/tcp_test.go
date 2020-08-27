@@ -17,10 +17,12 @@ package tcp_test
 import (
 	"bytes"
 	"fmt"
+	"log"
 	"math"
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -1576,8 +1578,8 @@ func TestOutOfOrderFlood(t *testing.T) {
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
 
-	// Create a new connection with initial window size of 10.
-	c.CreateConnected(789, 30000, 10)
+	rcvBufSz := 65536
+	c.CreateConnected(789, 30000, rcvBufSz)
 
 	if _, _, err := c.EP.Read(nil); err != tcpip.ErrWouldBlock {
 		t.Fatalf("got c.EP.Read(nil) = %s, want = %s", err, tcpip.ErrWouldBlock)
@@ -1842,6 +1844,7 @@ func TestFullWindowReceive(t *testing.T) {
 
 	// Fill up the window.
 	data := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	data = append(data, data...)
 	c.SendPacket(data, &context.Headers{
 		SrcPort: context.TestPort,
 		DstPort: c.Port,
@@ -1900,10 +1903,14 @@ func TestNoWindowShrinking(t *testing.T) {
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
 
-	// Start off with a window size of 10, then shrink it to 5.
-	c.CreateConnected(789, 30000, 10)
+	// Start off with a certain receive buffer then cut it in half and verify that
+	// the right edge of the window does not shrink.
+	// NOTE: Netstack doubles the value specified here.
+	rcvBufSize := 65536
+	iss := seqnum.Value(789)
+	c.CreateConnected(iss, 30000, rcvBufSize)
 
-	if err := c.EP.SetSockOptInt(tcpip.ReceiveBufferSizeOption, 5); err != nil {
+	if err := c.EP.SetSockOptInt(tcpip.ReceiveBufferSizeOption, rcvBufSize/2); err != nil {
 		t.Fatalf("SetSockOptInt(ReceiveBufferSizeOption, 5) failed: %s", err)
 	}
 
@@ -1915,16 +1922,18 @@ func TestNoWindowShrinking(t *testing.T) {
 		t.Fatalf("got c.EP.Read(nil) = %s, want = %s", err, tcpip.ErrWouldBlock)
 	}
 
-	// Send 3 bytes, check that the peer acknowledges them.
-	data := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	c.SendPacket(data[:3], &context.Headers{
+	data := generateRandomPayload(t, rcvBufSize)
+	seqNum := iss.Add(1)
+	// Send a payload of half the size of rcvBufSize.
+	c.SendPacket(data[:rcvBufSize/2], &context.Headers{
 		SrcPort: context.TestPort,
 		DstPort: c.Port,
 		Flags:   header.TCPFlagAck,
-		SeqNum:  790,
+		SeqNum:  seqNum,
 		AckNum:  c.IRS.Add(1),
 		RcvWnd:  30000,
 	})
+	seqNum = seqNum.Add(seqnum.Size(rcvBufSize / 2))
 
 	// Wait for receive to be notified.
 	select {
@@ -1933,27 +1942,43 @@ func TestNoWindowShrinking(t *testing.T) {
 		t.Fatalf("Timed out waiting for data to arrive")
 	}
 
-	// Check that data is acknowledged, and that window doesn't go to zero
-	// just yet because it was previously set to 10. It must go to 7 now.
+	// Check that data is acknowledged, and that window doesn't go to zero just
+	// yet. Since we specified rcvBufSize as 32768, WndScal calculated during the
+	// SYN by netstack will be 1 (since 2x32768 = 65536 > 65535( the max unscaled
+	// window) and in SYN it will offer the maximum permissible unscaled window
+	// 65535.
+	//
+	// Further netstack will make scale the value by wndScale to ensure
+	// that the window offered in SYN won't be reduced due to the loss of
+	// precision if window scaling is enabled.
+	//
+	// See: endpoint.initialReceiveWindow()
+	wndScale := 2
+	scaledBufSz := (math.MaxUint16 >> wndScale) << wndScale
+	expectedWnd := ((scaledBufSz / 2) >> wndScale) << wndScale
 	checker.IPv4(t, c.GetPacket(),
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.SeqNum(uint32(c.IRS)+1),
-			checker.AckNum(793),
+			checker.AckNum(uint32(seqNum)),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.Window(7),
+			// Since reducing buffer size should not shrink the available window this
+			// should still show a non-zero value.
+			checker.Window(uint16(expectedWnd)),
 		),
 	)
 
-	// Send 7 more bytes, check that the window fills up.
-	c.SendPacket(data[3:], &context.Headers{
+	// Send another payload of half the size of rcvBufSize. This should fill up the
+	// socket receive buffer and we should see a zero window.
+	c.SendPacket(data[rcvBufSize/2:], &context.Headers{
 		SrcPort: context.TestPort,
 		DstPort: c.Port,
 		Flags:   header.TCPFlagAck,
-		SeqNum:  793,
+		SeqNum:  seqNum,
 		AckNum:  c.IRS.Add(1),
 		RcvWnd:  30000,
 	})
+	seqNum = seqNum.Add(seqnum.Size(rcvBufSize / 2))
 
 	select {
 	case <-ch:
@@ -1965,14 +1990,14 @@ func TestNoWindowShrinking(t *testing.T) {
 		checker.TCP(
 			checker.DstPort(context.TestPort),
 			checker.SeqNum(uint32(c.IRS)+1),
-			checker.AckNum(uint32(790+len(data))),
+			checker.AckNum(uint32(seqNum)),
 			checker.TCPFlags(header.TCPFlagAck),
 			checker.Window(0),
 		),
 	)
 
 	// Receive data and check it.
-	read := make([]byte, 0, 10)
+	read := make([]byte, 0, rcvBufSize)
 	for len(read) < len(data) {
 		v, _, err := c.EP.Read(nil)
 		if err != nil {
@@ -1994,7 +2019,7 @@ func TestNoWindowShrinking(t *testing.T) {
 			checker.SeqNum(uint32(c.IRS)+1),
 			checker.AckNum(uint32(790+len(data))),
 			checker.TCPFlags(header.TCPFlagAck),
-			checker.Window(5),
+			checker.Window(0x8000),
 		),
 	)
 }
@@ -2123,7 +2148,7 @@ func TestScaledWindowConnect(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	// Check that data is received, and that advertised window is 0xbfff,
+	// Check that data is received, and that advertised window is 0x5fff,
 	// that is, that it is scaled.
 	b := c.GetPacket()
 	checker.IPv4(t, b,
@@ -2132,7 +2157,7 @@ func TestScaledWindowConnect(t *testing.T) {
 			checker.DstPort(context.TestPort),
 			checker.SeqNum(uint32(c.IRS)+1),
 			checker.AckNum(790),
-			checker.Window(0xbfff),
+			checker.Window(0x5fff),
 			checker.TCPFlagsMatch(header.TCPFlagAck, ^uint8(header.TCPFlagPsh)),
 		),
 	)
@@ -2198,7 +2223,8 @@ func TestScaledWindowAccept(t *testing.T) {
 	}
 
 	// Do 3-way handshake.
-	c.PassiveConnectWithOptions(100, 2, header.TCPSynOptions{MSS: defaultIPv4MSS})
+	// wndScale expected is 3 as 65535 * 3 * 2 < 65535 * 2^3 but > 65535 *2 *2
+	c.PassiveConnectWithOptions(100, 3 /* wndScale */, header.TCPSynOptions{MSS: defaultIPv4MSS})
 
 	// Try to accept the connection.
 	we, ch := waiter.NewChannelEntry(nil)
@@ -2228,7 +2254,7 @@ func TestScaledWindowAccept(t *testing.T) {
 		t.Fatalf("Write failed: %s", err)
 	}
 
-	// Check that data is received, and that advertised window is 0xbfff,
+	// Check that data is received, and that advertised window is 0x5fff,
 	// that is, that it is scaled.
 	b := c.GetPacket()
 	checker.IPv4(t, b,
@@ -2237,7 +2263,7 @@ func TestScaledWindowAccept(t *testing.T) {
 			checker.DstPort(context.TestPort),
 			checker.SeqNum(uint32(c.IRS)+1),
 			checker.AckNum(790),
-			checker.Window(0xbfff),
+			checker.Window(0x5fff),
 			checker.TCPFlagsMatch(header.TCPFlagAck, ^uint8(header.TCPFlagPsh)),
 		),
 	)
@@ -2324,18 +2350,19 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
 
-	// Set the window size such that a window scale of 4 will be used.
-	const wnd = 65535 * 10
-	const ws = uint32(4)
-	c.CreateConnectedWithRawOptions(789, 30000, wnd, []byte{
+	// Set the buffer size such that a window scale of 5 will be used.
+	const bufSz = 65535 * 10
+	const ws = uint32(5)
+	c.CreateConnectedWithRawOptions(789, 30000, bufSz, []byte{
 		header.TCPOptionWS, 3, 0, header.TCPOptionNOP,
 	})
 
 	// Write chunks of 50000 bytes.
-	remain := wnd
+	remain := 0
 	sent := 0
 	data := make([]byte, 50000)
-	for remain > len(data) {
+	// Keep writing till the window drops below len(data).
+	for {
 		c.SendPacket(data, &context.Headers{
 			SrcPort: context.TestPort,
 			DstPort: c.Port,
@@ -2345,21 +2372,25 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			RcvWnd:  30000,
 		})
 		sent += len(data)
-		remain -= len(data)
-		checker.IPv4(t, c.GetPacket(),
+		pkt := c.GetPacket()
+		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.SeqNum(uint32(c.IRS)+1),
 				checker.AckNum(uint32(790+sent)),
-				checker.Window(uint16(remain>>ws)),
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
+		// Don't reduce window to zero here.
+		if wnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()); wnd<<ws < len(data) {
+			remain = wnd << ws
+			break
+		}
 	}
 
 	// Make the window non-zero, but the scaled window zero.
-	if remain >= 16 {
+	for remain >= 16 {
 		data = data[:remain-15]
 		c.SendPacket(data, &context.Headers{
 			SrcPort: context.TestPort,
@@ -2370,22 +2401,35 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			RcvWnd:  30000,
 		})
 		sent += len(data)
-		remain -= len(data)
-		checker.IPv4(t, c.GetPacket(),
+		pkt := c.GetPacket()
+		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.SeqNum(uint32(c.IRS)+1),
 				checker.AckNum(uint32(790+sent)),
-				checker.Window(0),
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
+		// Since the receive buffer is split between window advertisement and
+		// application data buffer the window does not always reflect the space
+		// available and actual space available can be a bit more than what is
+		// advertised in the window.
+		wnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize())
+		if wnd == 0 {
+			break
+		}
+		remain = wnd << ws
 	}
 
-	// Read at least 1MSS of data. An ack should be sent in response to that.
+	// Read at least 2MSS of data. An ack should be sent in response to that.
+	// Since buffer space is now split in half between window and application
+	// data we need to read more than 1 MSS(65536) of data for a non-zero window
+	// update to be sent. For 1MSS worth of window to be available we need to
+	// read at least 128KB. Since our segments above were 50KB each it means
+	// we need to read at 3 packets.
 	sz := 0
-	for sz < defaultMTU {
+	for sz < defaultMTU*2 {
 		v, _, err := c.EP.Read(nil)
 		if err != nil {
 			t.Fatalf("Read failed: %s", err)
@@ -2399,7 +2443,7 @@ func TestZeroScaledWindowReceive(t *testing.T) {
 			checker.DstPort(context.TestPort),
 			checker.SeqNum(uint32(c.IRS)+1),
 			checker.AckNum(uint32(790+sent)),
-			checker.Window(uint16(sz>>ws)),
+			checker.WindowGreaterThanEq(uint16(defaultMTU>>ws)),
 			checker.TCPFlags(header.TCPFlagAck),
 		),
 	)
@@ -2964,7 +3008,7 @@ func TestSynOptionsOnActiveConnect(t *testing.T) {
 	// Set the buffer size to a deterministic size so that we can check the
 	// window scaling option.
 	const rcvBufferSize = 0x20000
-	const wndScale = 2
+	const wndScale = 3
 	if err := c.EP.SetSockOptInt(tcpip.ReceiveBufferSizeOption, rcvBufferSize); err != nil {
 		t.Fatalf("SetSockOptInt(ReceiveBufferSizeOption, %d) failed failed: %s", rcvBufferSize, err)
 	}
@@ -4280,14 +4324,14 @@ func TestMinMaxBufferSizes(t *testing.T) {
 		}
 	}
 
-	// Set values below the min.
-	if err := ep.SetSockOptInt(tcpip.ReceiveBufferSizeOption, 199); err != nil {
+	// Set values below the min/2.
+	if err := ep.SetSockOptInt(tcpip.ReceiveBufferSizeOption, 99); err != nil {
 		t.Fatalf("SetSockOptInt(ReceiveBufferSizeOption, 199) failed: %s", err)
 	}
 
 	checkRecvBufferSize(t, ep, 200)
 
-	if err := ep.SetSockOptInt(tcpip.SendBufferSizeOption, 299); err != nil {
+	if err := ep.SetSockOptInt(tcpip.SendBufferSizeOption, 149); err != nil {
 		t.Fatalf("SetSockOptInt(SendBufferSizeOption, 299) failed: %s", err)
 	}
 
@@ -4298,13 +4342,15 @@ func TestMinMaxBufferSizes(t *testing.T) {
 		t.Fatalf("SetSockOptInt(ReceiveBufferSizeOption) failed: %s", err)
 	}
 
-	checkRecvBufferSize(t, ep, tcp.DefaultReceiveBufferSize*20)
+	// Values above max are capped at max and then doubled.
+	checkRecvBufferSize(t, ep, tcp.DefaultReceiveBufferSize*20*2)
 
 	if err := ep.SetSockOptInt(tcpip.SendBufferSizeOption, 1+tcp.DefaultSendBufferSize*30); err != nil {
 		t.Fatalf("SetSockOptInt(SendBufferSizeOption) failed: %s", err)
 	}
 
-	checkSendBufferSize(t, ep, tcp.DefaultSendBufferSize*30)
+	// Values above max are capped at max and then doubled.
+	checkSendBufferSize(t, ep, tcp.DefaultSendBufferSize*30*2)
 }
 
 func TestBindToDeviceOption(t *testing.T) {
@@ -5962,16 +6008,14 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	time.Sleep(latency)
 	rawEP.SendPacketWithTS([]byte{1}, tsVal)
 
-	// Verify that the ACK has the expected window.
-	wantRcvWnd := receiveBufferSize
-	wantRcvWnd = (wantRcvWnd >> uint32(c.WindowScale))
-	rawEP.VerifyACKRcvWnd(uint16(wantRcvWnd - 1))
+	pkt := rawEP.VerifyAndReturnACKWithTS(tsVal)
+	rcvWnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize()
 	time.Sleep(25 * time.Millisecond)
 
 	// Allocate a large enough payload for the test.
-	b := make([]byte, int(receiveBufferSize)*2)
-	offset := 0
-	payloadSize := receiveBufferSize - 1
+	payloadSize := receiveBufferSize * 2
+	b := make([]byte, int(payloadSize))
+
 	worker := (c.EP).(interface {
 		StopWork()
 		ResumeWork()
@@ -5980,11 +6024,15 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 
 	// Stop the worker goroutine.
 	worker.StopWork()
-	start := offset
-	end := offset + payloadSize
+	start := 0
+	end := payloadSize / 2
 	packetsSent := 0
 	for ; start < end; start += mss {
-		rawEP.SendPacketWithTS(b[start:start+mss], tsVal)
+		packetEnd := start + mss
+		if start+mss > end {
+			packetEnd = end
+		}
+		rawEP.SendPacketWithTS(b[start:packetEnd], tsVal)
 		packetsSent++
 	}
 
@@ -5992,28 +6040,19 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	// are waiting to be read.
 	worker.ResumeWork()
 
-	// Since we read no bytes the window should goto zero till the
-	// application reads some of the data.
-	// Discard all intermediate acks except the last one.
-	if packetsSent > 100 {
-		for i := 0; i < (packetsSent / 100); i++ {
-			_ = c.GetPacket()
-		}
+	// Since we sent almost the full receive buffer worth of data (some may have
+	// been dropped due to segment overheads), we should get a zero window back.
+	pkt = c.GetPacket()
+	tcpHdr := header.TCP(header.IPv4(pkt).Payload())
+	gotRcvWnd := tcpHdr.WindowSize()
+	wantAckNum := tcpHdr.AckNumber()
+	if got, want := int(gotRcvWnd), 0; got != want {
+		t.Fatalf("got rcvWnd: %d, want: %d", got, want)
 	}
-	rawEP.VerifyACKRcvWnd(0)
 
 	time.Sleep(25 * time.Millisecond)
-	// Verify that sending more data when window is closed is dropped and
-	// not acked.
+	// Verify that sending more data when receiveBuffer is exhausted.
 	rawEP.SendPacketWithTS(b[start:start+mss], tsVal)
-
-	// Verify that the stack sends us back an ACK with the sequence number
-	// of the last packet sent indicating it was dropped.
-	p := c.GetPacket()
-	checker.IPv4(t, p, checker.TCP(
-		checker.AckNum(uint32(rawEP.NextSeqNum)-uint32(mss)),
-		checker.Window(0),
-	))
 
 	// Now read all the data from the endpoint and verify that advertised
 	// window increases to the full available buffer size.
@@ -6027,23 +6066,26 @@ func TestReceiveBufferAutoTuningApplicationLimited(t *testing.T) {
 	// Verify that we receive a non-zero window update ACK. When running
 	// under thread santizer this test can end up sending more than 1
 	// ack, 1 for the non-zero window
-	p = c.GetPacket()
+	p := c.GetPacket()
 	checker.IPv4(t, p, checker.TCP(
-		checker.AckNum(uint32(rawEP.NextSeqNum)-uint32(mss)),
+		checker.AckNum(uint32(wantAckNum)),
 		func(t *testing.T, h header.Transport) {
 			tcp, ok := h.(header.TCP)
 			if !ok {
 				return
 			}
-			if w := tcp.WindowSize(); w == 0 || w > uint16(wantRcvWnd) {
-				t.Errorf("expected a non-zero window: got %d, want <= wantRcvWnd", w)
+			// We use 10% here as the error margin upwards as the initial window we
+			// got was afer 1 segment was already in the receive buffer queue.
+			tolerance := 1.1
+			if w := tcp.WindowSize(); w == 0 || w > uint16(float64(rcvWnd)*tolerance) {
+				t.Errorf("expected a non-zero window: got %d, want <= %d", w, uint16(float64(rcvWnd)*tolerance))
 			}
 		},
 	))
 }
 
-// This test verifies that the auto tuning does not grow the receive buffer if
-// the application is not reading the data actively.
+// This test verifies that the advertised window is auto-tuned up as the
+// application is reading the data that is being received.
 func TestReceiveBufferAutoTuning(t *testing.T) {
 	const mtu = 1500
 	const mss = mtu - header.IPv4MinimumSize - header.TCPMinimumSize
@@ -6053,9 +6095,6 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 
 	// Enable Auto-tuning.
 	stk := c.Stack()
-	// Set lower limits for auto-tuning tests. This is required because the
-	// test stops the worker which can cause packets to be dropped because
-	// the segment queue holding unprocessed packets is limited to 300.
 	const receiveBufferSize = 80 << 10 // 80KB.
 	const maxReceiveBufferSize = receiveBufferSize * 10
 	{
@@ -6077,8 +6116,10 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 	c.WindowScale = uint8(tcp.FindWndScale(maxReceiveBufferSize))
 
 	rawEP := c.CreateConnectedWithOptions(header.TCPSynOptions{TS: true, WS: 4})
-
-	wantRcvWnd := receiveBufferSize
+	tsVal := uint32(rawEP.TSVal)
+	rawEP.SendPacketWithTS([]byte{1}, tsVal)
+	pkt := rawEP.VerifyAndReturnACKWithTS(tsVal)
+	curRcvWnd := int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()) << c.WindowScale
 	scaleRcvWnd := func(rcvWnd int) uint16 {
 		return uint16(rcvWnd >> uint16(c.WindowScale))
 	}
@@ -6095,14 +6136,8 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		StopWork()
 		ResumeWork()
 	})
-	tsVal := rawEP.TSVal
-	// We are going to do our own computation of what the moderated receive
-	// buffer should be based on sent/copied data per RTT and verify that
-	// the advertised window by the stack matches our calculations.
-	prevCopied := 0
-	done := false
 	latency := 1 * time.Millisecond
-	for i := 0; !done; i++ {
+	for i := 0; i < 5; i++ {
 		tsVal++
 
 		// Stop the worker goroutine.
@@ -6124,15 +6159,20 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		// Give 1ms for the worker to process the packets.
 		time.Sleep(1 * time.Millisecond)
 
-		// Verify that the advertised window on the ACK is reduced by
-		// the total bytes sent.
-		expectedWnd := wantRcvWnd - totalSent
-		if packetsSent > 100 {
-			for i := 0; i < (packetsSent / 100); i++ {
-				_ = c.GetPacket()
+		lastACK := c.GetPacket()
+		// Discard any intermediate ACKs and only check the last ACK we get in a
+		// short time period of few ms.
+		for {
+			time.Sleep(1 * time.Millisecond)
+			pkt := c.GetPacketNonBlocking()
+			if pkt == nil {
+				break
 			}
+			lastACK = pkt
 		}
-		rawEP.VerifyACKRcvWnd(scaleRcvWnd(expectedWnd))
+		if got, want := int(header.TCP(header.IPv4(lastACK).Payload()).WindowSize()), int(scaleRcvWnd(curRcvWnd)); got > want {
+			t.Fatalf("advertised window got: %d, want <= %d", got, want)
+		}
 
 		// Now read all the data from the endpoint and invoke the
 		// moderation API to allow for receive buffer auto-tuning
@@ -6157,35 +6197,20 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		rawEP.NextSeqNum--
 		rawEP.SendPacketWithTS(nil, tsVal)
 		rawEP.NextSeqNum++
-
 		if i == 0 {
 			// In the first iteration the receiver based RTT is not
 			// yet known as a result the moderation code should not
 			// increase the advertised window.
-			rawEP.VerifyACKRcvWnd(scaleRcvWnd(wantRcvWnd))
-			prevCopied = totalCopied
+			rawEP.VerifyACKRcvWnd(scaleRcvWnd(curRcvWnd))
 		} else {
-			rttCopied := totalCopied
-			if i == 1 {
-				// The moderation code accumulates copied bytes till
-				// RTT is established. So add in the bytes sent in
-				// the first iteration to the total bytes for this
-				// RTT.
-				rttCopied += prevCopied
-				// Now reset it to the initial value used by the
-				// auto tuning logic.
-				prevCopied = tcp.InitialCwnd * mss * 2
+			pkt := c.GetPacket()
+			curRcvWnd = int(header.TCP(header.IPv4(pkt).Payload()).WindowSize()) << c.WindowScale
+			// If thew new current window is close maxReceiveBufferSize then terminate
+			// the loop. This can happen before all iterations are done due to timing
+			// differences when running the test.
+			if int(float64(curRcvWnd)*1.1) > maxReceiveBufferSize/2 {
+				break
 			}
-			newWnd := rttCopied<<1 + 16*mss
-			grow := (newWnd * (rttCopied - prevCopied)) / prevCopied
-			newWnd += (grow << 1)
-			if newWnd > maxReceiveBufferSize {
-				newWnd = maxReceiveBufferSize
-				done = true
-			}
-			rawEP.VerifyACKRcvWnd(scaleRcvWnd(newWnd))
-			wantRcvWnd = newWnd
-			prevCopied = rttCopied
 			// Increase the latency after first two iterations to
 			// establish a low RTT value in the receiver since it
 			// only tracks the lowest value. This ensures that when
@@ -6198,6 +6223,12 @@ func TestReceiveBufferAutoTuning(t *testing.T) {
 		offset += payloadSize
 		payloadSize *= 2
 	}
+	// Check that at the end of our iterations the receive window grew close to the maximum
+	// permissible size of maxReceiveBufferSize/2
+	if got, want := int(float64(curRcvWnd)*1.1), maxReceiveBufferSize/2; got < want {
+		log.Fatalf("unexpected rcvWnd got: %d, want > %d", got, want)
+	}
+
 }
 
 func TestDelayEnabled(t *testing.T) {
@@ -7151,9 +7182,9 @@ func TestKeepaliveWithUserTimeout(t *testing.T) {
 	}
 }
 
-func TestIncreaseWindowOnReceive(t *testing.T) {
+func TestIncreaseWindowOnRead(t *testing.T) {
 	// This test ensures that the endpoint sends an ack,
-	// after recv() when the window grows to more than 1 MSS.
+	// after read() when the window grows by more than 1 MSS.
 	c := context.New(t, defaultMTU)
 	defer c.Cleanup()
 
@@ -7162,10 +7193,9 @@ func TestIncreaseWindowOnReceive(t *testing.T) {
 
 	// Write chunks of ~30000 bytes. It's important that two
 	// payloads make it equal or longer than MSS.
-	remain := rcvBuf
+	remain := rcvBuf * 2
 	sent := 0
 	data := make([]byte, defaultMTU/2)
-	lastWnd := uint16(0)
 
 	for remain > len(data) {
 		c.SendPacket(data, &context.Headers{
@@ -7178,39 +7208,36 @@ func TestIncreaseWindowOnReceive(t *testing.T) {
 		})
 		sent += len(data)
 		remain -= len(data)
-
-		lastWnd = uint16(remain)
-		if remain > 0xffff {
-			lastWnd = 0xffff
-		}
-		checker.IPv4(t, c.GetPacket(),
+		pkt := c.GetPacket()
+		checker.IPv4(t, pkt,
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.SeqNum(uint32(c.IRS)+1),
 				checker.AckNum(uint32(790+sent)),
-				checker.Window(lastWnd),
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
+		// Break once the window drops below defaultMTU/2
+		if wnd := header.TCP(header.IPv4(pkt).Payload()).WindowSize(); wnd < defaultMTU/2 {
+			break
+		}
 	}
 
-	if lastWnd == 0xffff || lastWnd == 0 {
-		t.Fatalf("expected small, non-zero window: %d", lastWnd)
+	// We now have < 1 MSS in the buffer space. Read at least > 2 MSS
+	// worth of data as receive buffer space
+	read := 0
+	// defaultMTU is a good enough estimate for the MSS used for this
+	// connection.
+	for read < defaultMTU*2 {
+		v, _, err := c.EP.Read(nil)
+		if err != nil {
+			t.Fatalf("Read failed: %s", err)
+		}
+		read += len(v)
 	}
 
-	// We now have < 1 MSS in the buffer space. Read the data! An
-	// ack should be sent in response to that. The window was not
-	// zero, but it grew to larger than MSS.
-	if _, _, err := c.EP.Read(nil); err != nil {
-		t.Fatalf("Read failed: %s", err)
-	}
-
-	if _, _, err := c.EP.Read(nil); err != nil {
-		t.Fatalf("Read failed: %s", err)
-	}
-
-	// After reading two packets, we surely crossed MSS. See the ack:
+	// After reading > MSS worth of data, we surely crossed MSS. See the ack:
 	checker.IPv4(t, c.GetPacket(),
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
@@ -7234,10 +7261,9 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 
 	// Write chunks of ~30000 bytes. It's important that two
 	// payloads make it equal or longer than MSS.
-	remain := rcvBuf
+	remain := rcvBuf * 2
 	sent := 0
 	data := make([]byte, defaultMTU/2)
-	lastWnd := uint16(0)
 
 	for remain > len(data) {
 		c.SendPacket(data, &context.Headers{
@@ -7251,31 +7277,22 @@ func TestIncreaseWindowOnBufferResize(t *testing.T) {
 		sent += len(data)
 		remain -= len(data)
 
-		lastWnd = uint16(remain)
-		if remain > 0xffff {
-			lastWnd = 0xffff
-		}
 		checker.IPv4(t, c.GetPacket(),
 			checker.PayloadLen(header.TCPMinimumSize),
 			checker.TCP(
 				checker.DstPort(context.TestPort),
 				checker.SeqNum(uint32(c.IRS)+1),
 				checker.AckNum(uint32(790+sent)),
-				checker.Window(lastWnd),
+				checker.WindowLessThanEq(0xffff),
 				checker.TCPFlags(header.TCPFlagAck),
 			),
 		)
-	}
-
-	if lastWnd == 0xffff || lastWnd == 0 {
-		t.Fatalf("expected small, non-zero window: %d", lastWnd)
 	}
 
 	// Increasing the buffer from should generate an ACK,
 	// since window grew from small value to larger equal MSS
 	c.EP.SetSockOptInt(tcpip.ReceiveBufferSizeOption, rcvBuf*2)
 
-	// After reading two packets, we surely crossed MSS. See the ack:
 	checker.IPv4(t, c.GetPacket(),
 		checker.PayloadLen(header.TCPMinimumSize),
 		checker.TCP(
@@ -7519,4 +7536,15 @@ func TestSetStackTimeWaitReuse(t *testing.T) {
 			t.Fatalf("got tcpip.TCPTimeWaitReuseOption: %v, want: %v", got, want)
 		}
 	}
+}
+
+// generateRandomPayload generates a random byte slice of the specified length
+// causing a fatal test failure if it is unable to do so.
+func generateRandomPayload(t *testing.T, n int) []byte {
+	t.Helper()
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("rand.Read(buf) failed: %s", err)
+	}
+	return buf
 }

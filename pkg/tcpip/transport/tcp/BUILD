@@ -93,6 +93,7 @@ go_test(
     shard_count = 10,
     deps = [
         ":tcp",
+        "//pkg/rand",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",

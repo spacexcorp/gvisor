@@ -201,7 +201,6 @@ func (d *dispatcher) queuePacket(r *stack.Route, stackEP stack.TransportEndpoint
 		s.decRef()
 		return
 	}
-
 	// For sockets not in established state let the worker goroutine
 	// handle the packets.
 	if ep.EndpointState() != StateEstablished {
