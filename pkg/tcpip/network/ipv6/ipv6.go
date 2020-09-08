@@ -22,12 +22,14 @@ package ipv6
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/fragmentation"
+	nethash "gvisor.dev/gvisor/pkg/tcpip/network/hash"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -42,6 +44,9 @@ const (
 	// DefaultTTL is the default hop limit for IPv6 Packets egressed by
 	// Netstack.
 	DefaultTTL = 64
+
+	// buckets is the number of identifier buckets.
+	buckets = 2048
 )
 
 type endpoint struct {
@@ -100,7 +105,39 @@ func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params s
 		SrcAddr:       r.LocalAddress,
 		DstAddr:       r.RemoteAddress,
 	})
-	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
+	pkt.NetworkProtocolNumber = ProtocolNumber
+}
+
+func (e *endpoint) packetMustBeFragmented(pkt *stack.PacketBuffer, gso *stack.GSO) bool {
+	return pkt.Size() > int(e.linkEP.MTU()) && (gso == nil || gso.Type == stack.GSONone)
+}
+
+// writePacketFragments will call e.linkEP.WritePacket for each fragment. mtu
+// includes the Network header. The transport header may be set. The transport
+// header protocol number is required to optimize fragmentation and avoid
+// parsing the IPv6 extension headers.
+func (e *endpoint) writePacketFragments(r *stack.Route, gso *stack.GSO, mtu int, pkt *stack.PacketBuffer, transProto tcpip.TransportProtocolNumber) (int, *tcpip.Error) {
+	id := atomic.AddUint32(&e.protocol.ids[hashRoute(r, e.protocol.hashIV)%buckets], 1)
+	pf := fragmentation.MakePacketFragmenter(pkt, uint32(mtu), header.IPv6FragmentHeaderSize)
+	networkHeader := header.IPv6(pkt.NetworkHeader().View())
+
+	// TODO(#3884): Evaluate whether we want to send each fragment one by one
+	// using WritePacket() (current strategy) or if we want to create a
+	// PacketBufferList from the fragments and feed it to WritePackets(). It'll be
+	// faster but cost more memory.
+	var n int
+	var fragPkt *stack.PacketBuffer
+	more := true
+	for more {
+		fragPkt, more = buildNextFragment(&pf, networkHeader, transProto, id)
+		if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, fragPkt); err != nil {
+			return n, err
+		}
+		r.Stats().IP.PacketsSent.Increment()
+		n++
+	}
+
+	return n, nil
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
@@ -121,11 +158,20 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 		return nil
 	}
 
+	if e.packetMustBeFragmented(pkt, gso) {
+		_, err := e.writePacketFragments(r, gso, int(e.linkEP.MTU()), pkt, params.Protocol)
+		return err
+	}
+
+	if err := e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt); err != nil {
+		return err
+	}
+
 	r.Stats().IP.PacketsSent.Increment()
-	return e.linkEP.WritePacket(r, gso, ProtocolNumber, pkt)
+	return nil
 }
 
-// WritePackets implements stack.LinkEndpoint.WritePackets.
+// WritePackets implements stack.NetworkEndpoint.WritePackets.
 func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, params stack.NetworkHeaderParams) (int, *tcpip.Error) {
 	if r.Loop&stack.PacketLoop != 0 {
 		panic("not implemented")
@@ -136,6 +182,20 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 
 	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
 		e.addIPHeader(r, pb, params)
+		if e.packetMustBeFragmented(pb, gso) {
+			id := atomic.AddUint32(&e.protocol.ids[hashRoute(r, e.protocol.hashIV)%buckets], 1)
+			pf := fragmentation.MakePacketFragmenter(pb, uint32(e.linkEP.MTU()), header.IPv6FragmentHeaderSize)
+			networkHeader := header.IPv6(pb.NetworkHeader().View())
+			currentElem := pb
+			var fragPkt *stack.PacketBuffer
+			more := true
+			for more {
+				fragPkt, more = buildNextFragment(&pf, networkHeader, params.Protocol, id)
+				pkts.InsertAfter(currentElem, fragPkt)
+				currentElem = fragPkt
+			}
+			pkts.Remove(pb)
+		}
 	}
 
 	n, err := e.linkEP.WritePackets(r, gso, pkts, ProtocolNumber)
@@ -425,6 +485,9 @@ func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
 }
 
 type protocol struct {
+	ids    []uint32
+	hashIV uint32
+
 	// defaultTTL is the current default TTL for the protocol. Only the
 	// uint8 portion of it is meaningful and it must be accessed
 	// atomically.
@@ -570,7 +633,7 @@ traverseExtensions:
 	}
 	ipHdr = header.IPv6(hdr)
 	pkt.Data.CapLength(int(ipHdr.PayloadLength()))
-	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
+	pkt.NetworkProtocolNumber = ProtocolNumber
 
 	return nextHdr, foundNext, true
 }
@@ -585,10 +648,59 @@ func calculateMTU(mtu uint32) uint32 {
 	return maxPayloadSize
 }
 
+// hashRoute calculates a hash value for the given route. It uses the source &
+// destination address and hashIV, a random initial value (generated once on
+// initialization) to generate the hash.
+func hashRoute(r *stack.Route, hashIV uint32) uint32 {
+	// The FNV-1a was chosen because it is a fast hashing algorithm, and
+	// cryptographic properties are not needed here.
+	hash := fnv.New32a()
+	hash.Write([]byte(r.LocalAddress))
+	a := hash.Sum32()
+
+	hash.Reset()
+	hash.Write([]byte(r.RemoteAddress))
+	b := hash.Sum32()
+
+	return nethash.Hash2Words(a, b, hashIV)
+}
+
 // NewProtocol returns an IPv6 network protocol.
 func NewProtocol() stack.NetworkProtocol {
+	ids := nethash.RandN32(buckets)
+	hashIV := nethash.RandN32(1)[0]
+
 	return &protocol{
+		ids:           ids,
+		hashIV:        hashIV,
 		defaultTTL:    DefaultTTL,
 		fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
 	}
+}
+
+func buildNextFragment(pf *fragmentation.PacketFragmenter, originalIPHeaders header.IPv6, transportProto tcpip.TransportProtocolNumber, id uint32) (*stack.PacketBuffer, bool) {
+	fragPkt, offset, copied, more := pf.BuildNextFragment(header.IPv6ProtocolNumber)
+
+	originalIPHeadersLength := len(originalIPHeaders)
+
+	fragmentIPHeadersLength := originalIPHeadersLength + header.IPv6FragmentHeaderSize
+	fragmentIPHeaders := header.IPv6(fragPkt.NetworkHeader().Push(fragmentIPHeadersLength))
+
+	// Copy the IPv6 header and any extension headers already populated.
+	if copied := copy(fragmentIPHeaders, originalIPHeaders); copied != originalIPHeadersLength {
+		panic(fmt.Sprintf("wrong number of bytes copied into fragmentIPHeaders: got %d, want %d", copied, originalIPHeadersLength))
+	}
+	fragmentIPHeaders.SetNextHeader(header.IPv6FragmentHeader)
+	fragmentIPHeaders.SetPayloadLength(uint16(copied) + (uint16(fragmentIPHeadersLength - header.IPv6MinimumSize)))
+
+	// Populate the newly added Fragment header.
+	fragmentHeader := header.IPv6Fragment(fragmentIPHeaders[originalIPHeadersLength:])
+	fragmentHeader.Encode(&header.IPv6FragmentFields{
+		M:              more,
+		FragmentOffset: uint16(offset / header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit),
+		Identification: id,
+		NextHeader:     uint8(transportProto),
+	})
+
+	return fragPkt, more
 }

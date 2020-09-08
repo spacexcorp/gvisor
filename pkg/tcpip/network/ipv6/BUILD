@@ -14,6 +14,7 @@ go_library(
         "//pkg/tcpip/buffer",
         "//pkg/tcpip/header",
         "//pkg/tcpip/network/fragmentation",
+        "//pkg/tcpip/network/hash",
         "//pkg/tcpip/stack",
     ],
 )
@@ -34,8 +35,10 @@ go_test(
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/sniffer",
+        "//pkg/tcpip/network/testutil",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/icmp",
+        "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/udp",
         "//pkg/waiter",
         "@com_github_google_go_cmp//cmp:go_default_library",

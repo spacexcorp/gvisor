@@ -246,6 +246,9 @@ func TestFragmentation(t *testing.T) {
 			if got, want := len(r.linkEP.WrittenPackets), int(r.Stats().IP.PacketsSent.Value()); got != want {
 				t.Errorf("no errors yet len(r.linkEP.WrittenPackets) got %d, want %d", got, want)
 			}
+			if got, want := int(r.Stats().IP.PacketsSent.Value()), ft.expectedFrags; got != want {
+				t.Errorf("no errors yet len(result) got %d, want %d", got, want)
+			}
 			compareFragments(t, r.linkEP.WrittenPackets, source, ft.mtu)
 		})
 	}

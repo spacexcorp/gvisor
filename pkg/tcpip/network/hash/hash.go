@@ -65,6 +65,12 @@ func Hash3Words(a, b, c, initval uint32) uint32 {
 	return c
 }
 
+// Hash2Words calculates the Jenkins hash of 2 32-bit words. This is adapted
+// from linux.
+func Hash2Words(a, b, initval uint32) uint32 {
+	return Hash3Words(a, b, 0, initval)
+}
+
 // IPv4FragmentHash computes the hash of the IPv4 fragment as suggested in RFC 791.
 func IPv4FragmentHash(h header.IPv4) uint32 {
 	x := uint32(h.ID())<<16 | uint32(h.Protocol())

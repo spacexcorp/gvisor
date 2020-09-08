@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package fragmentation contains the implementation of IP fragmentation.
-// It is based on RFC 791 and RFC 815.
+// It is based on RFC 791, RFC 815 and RFC 8200.
 package fragmentation
 
 import (
@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -210,4 +211,120 @@ func (f *Fragmentation) release(r *reassembler) {
 		log.Printf("memory counter < 0 (%d), this is an accounting bug that requires investigation", f.size)
 		f.size = 0
 	}
+}
+
+// PacketFragmenter is the book-keeping struct for packet fragmentation.
+type PacketFragmenter struct {
+	transportHeader          buffer.View
+	data                     buffer.VectorisedView
+	baseReserve              int
+	innerMTU                 int
+	fragmentCount            uint32
+	currentFragment          uint32
+	fragmentOffset           uint16
+	transportHeaderFitsFirst bool
+}
+
+// MakePacketFragmenter prepares the struct needed for packet fragmentation.
+//
+// pkt is the packet to be fragmented.
+//
+// mtu is the maximum size of the payload a Link layer frame can take. Each
+// generated fragment must fit in it (Network headers included).
+//
+// extraHeaderLength can be used to reserve extra space for the headers, if we
+// need more than what is pre-allocated in the initial packet.
+func MakePacketFragmenter(pkt *stack.PacketBuffer, mtu uint32, extraHeaderLength int) PacketFragmenter {
+	// Each fragment will *at least* reserve the bytes available to the Link Layer
+	// (which are currently the only unused header bytes) and the bytes dedicated
+	// to the Network header.
+	baseReserve := pkt.AvailableHeaderBytes() + pkt.NetworkHeader().View().Size() + extraHeaderLength
+	innerMTU := int(mtu) - pkt.NetworkHeader().View().Size() - extraHeaderLength
+
+	// Round the MTU down to align to 8 bytes.
+	innerMTU &^= 7
+
+	// As per RFC 8200 Section 4.5, some IPv6 extension headers should not be
+	// repeated in each fragment. However we do not currently support any header
+	// of that kind yet, so the following computation is valid for both IPv4 and
+	// IPv6.
+	// TODO(gvisor.dev/issue/3912): Once Authentication and/or ESP Headers are
+	// supported for outbound packets, the length of the IPv6 fragmentable part
+	// need to take these headers into account.
+	fragmentablePartLength := pkt.TransportHeader().View().Size() + pkt.Data.Size()
+
+	return PacketFragmenter{
+		transportHeader:          pkt.TransportHeader().View(),
+		data:                     pkt.Data,
+		baseReserve:              baseReserve,
+		innerMTU:                 innerMTU,
+		fragmentCount:            uint32((fragmentablePartLength + innerMTU - 1) / innerMTU),
+		transportHeaderFitsFirst: pkt.TransportHeader().View().Size() <= innerMTU,
+	}
+}
+
+// BuildNextFragment returns a packet with the payload of the next fragment,
+// along with the fragment's offset, the number of bytes copied and a boolean
+// indicating if there are more fragments left or not. If this function is
+// called again after it indicated that no more fragments were left, it will
+// panic.
+//
+// Note that the returned packet will not have its network header & link headers
+// populated, but the space for them will be reserved. The first fragment may
+// have its transport header populated.
+func (pf *PacketFragmenter) BuildNextFragment(proto tcpip.NetworkProtocolNumber) (*stack.PacketBuffer, uint16, uint16, bool) {
+	if pf.currentFragment >= pf.fragmentCount {
+		panic("BuildNextFragment should not be called again after every fragment was built")
+	}
+
+	reserve := pf.baseReserve
+
+	// Where possible, the first fragment that is sent has the same
+	// number of bytes reserved for header as the input packet. The link-layer
+	// endpoint may depend on this for looking at, eg, L4 headers.
+	if pf.currentFragment == 0 && pf.transportHeaderFitsFirst {
+		reserve += pf.transportHeader.Size()
+	}
+
+	fragPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: reserve,
+	})
+	fragPkt.NetworkProtocolNumber = proto
+
+	// Copy data for the fragment.
+	avail := pf.innerMTU
+
+	if n := len(pf.transportHeader); n > 0 {
+		if n > avail {
+			n = avail
+		}
+		if pf.currentFragment == 0 && pf.transportHeaderFitsFirst {
+			if copied := copy(fragPkt.TransportHeader().Push(n), pf.transportHeader); copied < n {
+				panic(fmt.Sprintf("wrong number of bytes copied into transport header: got %d, want %d", copied, n))
+			}
+		} else {
+			fragPkt.Data.AppendView(pf.transportHeader[:n:n])
+		}
+		pf.transportHeader = pf.transportHeader[n:]
+		avail -= n
+	}
+
+	if avail > 0 {
+		n := pf.data.Size()
+		if n > avail {
+			n = avail
+		}
+		pf.data.ReadToVV(&fragPkt.Data, n)
+		avail -= n
+	}
+
+	offset := pf.fragmentOffset
+	copied := uint16(pf.innerMTU - avail)
+
+	pf.fragmentOffset += copied
+	pf.currentFragment++
+
+	more := pf.currentFragment != pf.fragmentCount
+
+	return fragPkt, offset, copied, more
 }

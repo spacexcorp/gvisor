@@ -7,7 +7,10 @@ go_library(
     srcs = [
         "testutil.go",
     ],
-    visibility = ["//pkg/tcpip/network/ipv4:__pkg__"],
+    visibility = [
+        "//pkg/tcpip/network/ipv4:__pkg__",
+        "//pkg/tcpip/network/ipv6:__pkg__",
+    ],
     deps = [
         "//pkg/tcpip",
         "//pkg/tcpip/buffer",
