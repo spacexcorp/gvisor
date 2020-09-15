@@ -1046,3 +1046,198 @@ func TestReceiveFragments(t *testing.T) {
 		})
 	}
 }
+
+func TestGSOStats(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*testing.T, *stack.Stack)
+		linkEP     stack.LinkEndpoint
+		expectSent int
+	}{
+		{
+			name: "Accept all",
+			// No setup needed, tables accept everything by default.
+			setup:      func(*testing.T, *stack.Stack) {},
+			linkEP:     &limitedEP{3},
+			expectSent: 3,
+		}, {
+			name: "Accept all with error",
+			// No setup needed, tables accept everything by default.
+			setup:      func(*testing.T, *stack.Stack) {},
+			linkEP:     &limitedEP{1},
+			expectSent: 1,
+		}, {
+			name: "Drop all",
+			setup: func(t *testing.T, stk *stack.Stack) {
+				// Install Output DROP rule.
+				t.Helper()
+				ipt := stk.IPTables()
+				filter, ok := ipt.GetTable(stack.FilterTable, false /* ipv6 */)
+				if !ok {
+					t.Fatalf("failed to find filter table")
+				}
+				ruleIdx := filter.BuiltinChains[stack.Output]
+				filter.Rules[ruleIdx].Target = stack.DropTarget{}
+				if err := ipt.ReplaceTable(stack.FilterTable, filter, false /* ipv6 */); err != nil {
+					t.Fatalf("failed to replace table: %v", err)
+				}
+			},
+			linkEP:     &limitedEP{3},
+			expectSent: 0,
+		}, {
+			name: "Drop some",
+			setup: func(t *testing.T, stk *stack.Stack) {
+				// Install Output DROP rule that matches only 1
+				// of the 3 packets.
+				t.Helper()
+				ipt := stk.IPTables()
+				filter, ok := ipt.GetTable(stack.FilterTable, false /* ipv6 */)
+				if !ok {
+					t.Fatalf("failed to find filter table")
+				}
+				// We'll match and DROP after 2 packets.
+				ruleIdx := filter.BuiltinChains[stack.Output]
+				filter.Rules[ruleIdx].Target = stack.DropTarget{}
+				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{2}}
+				// Make sure the next rule is ACCEPT.
+				filter.Rules[ruleIdx+1].Target = stack.AcceptTarget{}
+				if err := ipt.ReplaceTable(stack.FilterTable, filter, false /* ipv6 */); err != nil {
+					t.Fatalf("failed to replace table: %v", err)
+				}
+			},
+			linkEP:     &limitedEP{3},
+			expectSent: 2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rt := buildRoute(t, nil, test.linkEP)
+
+			// Send 3 packets through the endpoint.
+			var pbl stack.PacketBufferList
+			for i := 0; i < 3; i++ {
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					ReserveHeaderBytes: header.UDPMinimumSize + int(rt.MaxHeaderLength()),
+					Data:               buffer.NewView(1).ToVectorisedView(),
+				})
+				pkt.TransportHeader().Push(header.UDPMinimumSize)
+				pbl.PushBack(pkt)
+			}
+
+			test.setup(t, rt.Stack())
+
+			nWritten, err := rt.WritePackets(nil, pbl, stack.NetworkHeaderParams{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := int(rt.Stats().IP.PacketsSent.Value())
+			if got != test.expectSent {
+				t.Errorf("sent %d packets, but expected to send %d", got, test.expectSent)
+			}
+			if got != nWritten {
+				t.Errorf("sent %d packets, WritePackets returned %d", got, nWritten)
+			}
+		})
+	}
+}
+
+func buildRoute(t *testing.T, packetCollectorErrors []*tcpip.Error, linkEP stack.LinkEndpoint) stack.Route {
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv4.NewProtocol()},
+	})
+	s.CreateNIC(1, linkEP)
+	const (
+		src = "\x10\x00\x00\x01"
+		dst = "\x10\x00\x00\x02"
+	)
+	s.AddAddress(1, ipv4.ProtocolNumber, src)
+	{
+		subnet, err := tcpip.NewSubnet(dst, tcpip.AddressMask(header.IPv4Broadcast))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.SetRouteTable([]tcpip.Route{{
+			Destination: subnet,
+			NIC:         1,
+		}})
+	}
+	rt, err := s.FindRoute(0, src, dst, ipv4.ProtocolNumber, false /* multicastLoop */)
+	if err != nil {
+		t.Fatalf("s.FindRoute got %v, want %v", err, nil)
+	}
+	return rt
+}
+
+// limitedEP is a link endpoint that writes up to a certain number of packets
+// before returning errors.
+type limitedEP struct {
+	limit int
+}
+
+func (ep *limitedEP) MTU() uint32 { return 0 }
+
+func (ep *limitedEP) Capabilities() stack.LinkEndpointCapabilities { return 0 }
+
+func (ep *limitedEP) MaxHeaderLength() uint16 { return 0 }
+
+func (ep *limitedEP) LinkAddress() tcpip.LinkAddress { return "" }
+
+func (ep *limitedEP) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
+	if ep.limit == 0 {
+		return tcpip.ErrInvalidEndpointState
+	}
+	ep.limit--
+	return nil
+}
+
+func (ep *limitedEP) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+	if ep.limit == 0 {
+		return 0, tcpip.ErrInvalidEndpointState
+	}
+	nWritten := ep.limit
+	if nWritten > pkts.Len() {
+		nWritten = pkts.Len()
+	}
+	ep.limit -= nWritten
+	return nWritten, nil
+}
+
+func (ep *limitedEP) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
+	if ep.limit == 0 {
+		return tcpip.ErrInvalidEndpointState
+	}
+	ep.limit--
+	return nil
+}
+
+func (ep *limitedEP) Attach(dispatcher stack.NetworkDispatcher) {}
+
+func (ep *limitedEP) IsAttached() bool { return false }
+
+func (ep *limitedEP) Wait() {}
+
+func (ep *limitedEP) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareEther }
+
+func (ep *limitedEP) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+}
+
+// limitedMatcher is an iptables matcher that matches after a certain number of
+// packets are checked against it.
+type limitedMatcher struct {
+	limit int
+}
+
+func (*limitedMatcher) Name() string {
+	return "limitedMatcher"
+}
+
+// Match implements Matcher.Match.
+func (lm *limitedMatcher) Match(stack.Hook, *stack.PacketBuffer, string) (bool, bool) {
+	if lm.limit == 0 {
+		return true, false
+	}
+	lm.limit--
+	return false, false
+}
