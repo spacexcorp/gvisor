@@ -127,19 +127,13 @@ func (fs *Filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		}
 	}
 	if child == nil {
-		// Dentry isn't cached; it either doesn't exist or failed
-		// revalidation. Attempt to resolve it via Lookup.
-		//
-		// FIXME(gvisor.dev/issue/1193): Inode.Lookup() should return
-		// *(kernfs.)Dentry, not *vfs.Dentry, since (kernfs.)Filesystem assumes
-		// that all dentries in the filesystem are (kernfs.)Dentry and performs
-		// vfs.DentryImpl casts accordingly.
-		childVFSD, err := parent.inode.Lookup(ctx, name)
+		// Dentry isn't cached; it either doesn't exist or failed revalidation.
+		// Attempt to resolve it via Lookup.
+		child, err := parent.inode.Lookup(ctx, name)
 		if err != nil {
 			return nil, err
 		}
 		// Reference on childVFSD dropped by a corresponding Valid.
-		child = childVFSD.Impl().(*Dentry)
 		parent.insertChildLocked(name, child)
 	}
 	return child, nil
@@ -215,10 +209,15 @@ func checkCreateLocked(ctx context.Context, rp *vfs.ResolvingPath, parentVFSD *v
 	if len(pc) > linux.NAME_MAX {
 		return "", syserror.ENAMETOOLONG
 	}
-	// FIXME(gvisor.dev/issue/1193): Data race due to not holding dirMu.
-	if _, ok := parentVFSD.Impl().(*Dentry).children[pc]; ok {
+
+	parent := parentVFSD.Impl().(*Dentry)
+	parent.dirMu.Lock()
+	if _, ok := parent.children[pc]; ok {
+		parent.dirMu.Unlock()
 		return "", syserror.EEXIST
 	}
+	parent.dirMu.Unlock()
+
 	if parentVFSD.IsDead() {
 		return "", syserror.ENOENT
 	}
