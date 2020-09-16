@@ -73,14 +73,17 @@ type FragmentID struct {
 // Fragmentation is the main structure that other modules
 // of the stack should use to implement IP Fragmentation.
 type Fragmentation struct {
-	mu           sync.Mutex
-	highLimit    int
-	lowLimit     int
-	reassemblers map[FragmentID]*reassembler
-	rList        reassemblerList
-	size         int
-	timeout      time.Duration
-	blockSize    uint16
+	mu                  sync.Mutex
+	highLimit           int
+	lowLimit            int
+	reassemblers        map[FragmentID]*reassembler
+	rList               reassemblerList
+	size                int
+	timeout             time.Duration
+	blockSize           uint16
+	clock               tcpip.Clock
+	releaseJob          *tcpip.Job
+	releaseJobScheduled bool
 }
 
 // NewFragmentation creates a new Fragmentation.
@@ -97,7 +100,7 @@ type Fragmentation struct {
 // reassemblingTimeout specifies the maximum time allowed to reassemble a packet.
 // Fragments are lazily evicted only when a new a packet with an
 // already existing fragmentation-id arrives after the timeout.
-func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration) *Fragmentation {
+func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock) *Fragmentation {
 	if lowMemoryLimit >= highMemoryLimit {
 		lowMemoryLimit = highMemoryLimit
 	}
@@ -110,13 +113,17 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 		blockSize = minBlockSize
 	}
 
-	return &Fragmentation{
+	f := &Fragmentation{
 		reassemblers: make(map[FragmentID]*reassembler),
 		highLimit:    highMemoryLimit,
 		lowLimit:     lowMemoryLimit,
 		timeout:      reassemblingTimeout,
 		blockSize:    blockSize,
+		clock:        clock,
 	}
+	f.releaseJob = tcpip.NewJob(f.clock, &f.mu, f.releaseReassemblersLocked)
+
+	return f
 }
 
 // Process processes an incoming fragment belonging to an ID and returns a
@@ -155,15 +162,13 @@ func (f *Fragmentation) Process(
 
 	f.mu.Lock()
 	r, ok := f.reassemblers[id]
-	if ok && r.tooOld(f.timeout) {
-		// This is very likely to be an id-collision or someone performing a slow-rate attack.
-		f.release(r)
-		ok = false
-	}
 	if !ok {
-		r = newReassembler(id)
+		r = newReassembler(id, f.clock)
 		f.reassemblers[id] = r
 		f.rList.PushFront(r)
+		if !f.releaseJobScheduled {
+			f.releaseReassemblersLocked()
+		}
 	}
 	f.mu.Unlock()
 
@@ -209,5 +214,26 @@ func (f *Fragmentation) release(r *reassembler) {
 	if f.size < 0 {
 		log.Printf("memory counter < 0 (%d), this is an accounting bug that requires investigation", f.size)
 		f.size = 0
+	}
+}
+
+// releaseReassemblersLocked releases all expired reassemblers then schedules
+// the job to call back itself for the rest of reassemblers (if any) in the
+// future. This function must be called with f.mu locked.
+func (f *Fragmentation) releaseReassemblersLocked() {
+	f.releaseJobScheduled = false
+	now := f.clock.NowNanoseconds()
+	for {
+		r := f.rList.Back()
+		if r == nil {
+			break
+		}
+		elapsed := time.Duration(now-r.creationTime) * time.Nanosecond
+		if f.timeout > elapsed {
+			f.releaseJob.Schedule(f.timeout - elapsed)
+			f.releaseJobScheduled = true
+			break
+		}
+		f.release(r)
 	}
 }

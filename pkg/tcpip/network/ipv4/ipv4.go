@@ -595,6 +595,6 @@ func NewProtocol() stack.NetworkProtocol {
 		ids:           ids,
 		hashIV:        hashIV,
 		defaultTTL:    DefaultTTL,
-		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
+		fragmentation: fragmentation.NewFragmentation(fragmentblockSize, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, &tcpip.StdClock{}),
 	}
 }

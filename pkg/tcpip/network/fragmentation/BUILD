@@ -42,6 +42,8 @@ go_test(
     ],
     library = ":fragmentation",
     deps = [
+        "//pkg/tcpip",
         "//pkg/tcpip/buffer",
+        "//pkg/tcpip/faketime",
     ],
 )

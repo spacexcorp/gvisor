@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package stack
+// Package faketime provides a fake clock that implements tcpip.Clock interface.
+package faketime
 
 import (
 	"container/heap"
@@ -23,7 +24,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
-type fakeClock struct {
+// FakeClock implements tcpip.Clock and can be used for a test to control the
+// advancement of the clock.
+type FakeClock struct {
 	clock clockwork.FakeClock
 
 	// mu protects the fields below.
@@ -39,28 +42,29 @@ type fakeClock struct {
 	waitGroups map[time.Time]*sync.WaitGroup
 }
 
-func newFakeClock() *fakeClock {
-	return &fakeClock{
+// NewFakeClock creates a new FakeClock instance.
+func NewFakeClock() *FakeClock {
+	return &FakeClock{
 		clock:      clockwork.NewFakeClock(),
 		times:      &timeHeap{},
 		waitGroups: make(map[time.Time]*sync.WaitGroup),
 	}
 }
 
-var _ tcpip.Clock = (*fakeClock)(nil)
+var _ tcpip.Clock = (*FakeClock)(nil)
 
 // NowNanoseconds implements tcpip.Clock.NowNanoseconds.
-func (fc *fakeClock) NowNanoseconds() int64 {
+func (fc *FakeClock) NowNanoseconds() int64 {
 	return fc.clock.Now().UnixNano()
 }
 
 // NowMonotonic implements tcpip.Clock.NowMonotonic.
-func (fc *fakeClock) NowMonotonic() int64 {
+func (fc *FakeClock) NowMonotonic() int64 {
 	return fc.NowNanoseconds()
 }
 
 // AfterFunc implements tcpip.Clock.AfterFunc.
-func (fc *fakeClock) AfterFunc(d time.Duration, f func()) tcpip.Timer {
+func (fc *FakeClock) AfterFunc(d time.Duration, f func()) tcpip.Timer {
 	until := fc.clock.Now().Add(d)
 	wg := fc.addWait(until)
 	return &fakeTimer{
@@ -75,7 +79,7 @@ func (fc *fakeClock) AfterFunc(d time.Duration, f func()) tcpip.Timer {
 
 // addWait adds an additional wait to the WaitGroup for parallel execution of
 // all work scheduled for t. Returns a reference to the WaitGroup modified.
-func (fc *fakeClock) addWait(t time.Time) *sync.WaitGroup {
+func (fc *FakeClock) addWait(t time.Time) *sync.WaitGroup {
 	fc.mu.RLock()
 	wg, ok := fc.waitGroups[t]
 	fc.mu.RUnlock()
@@ -101,7 +105,7 @@ func (fc *fakeClock) addWait(t time.Time) *sync.WaitGroup {
 
 // removeWait removes a wait from the WaitGroup for parallel execution of all
 // work scheduled for t.
-func (fc *fakeClock) removeWait(t time.Time) {
+func (fc *FakeClock) removeWait(t time.Time) {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
 
@@ -109,9 +113,9 @@ func (fc *fakeClock) removeWait(t time.Time) {
 	wg.Done()
 }
 
-// advance executes all work that have been scheduled to execute within d from
+// Advance executes all work that have been scheduled to execute within d from
 // the current fake time. Blocks until all work has completed execution.
-func (fc *fakeClock) advance(d time.Duration) {
+func (fc *FakeClock) Advance(d time.Duration) {
 	// Block until all the work is done
 	until := fc.clock.Now().Add(d)
 	for {
@@ -146,7 +150,7 @@ func (fc *fakeClock) advance(d time.Duration) {
 }
 
 type fakeTimer struct {
-	clock *fakeClock
+	clock *FakeClock
 	timer clockwork.Timer
 
 	mu    sync.RWMutex

@@ -589,6 +589,6 @@ func calculateMTU(mtu uint32) uint32 {
 func NewProtocol() stack.NetworkProtocol {
 	return &protocol{
 		defaultTTL:    DefaultTTL,
-		fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
+		fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout, &tcpip.StdClock{}),
 	}
 }
