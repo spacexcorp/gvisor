@@ -334,6 +334,11 @@ TEST_F(StatTest, LeadingDoubleSlash) {
 // Test that a rename doesn't change the underlying file.
 TEST_F(StatTest, StatDoesntChangeAfterRename) {
   const TempPath old_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  struct statfs statfs_buf;
+  if (statfs(old_dir.path().c_str(), &statfs_buf) == 0) {
+    // Overlay filesystems may synthesize directory inode numbers on the fly.
+    SKIP_IF(statfs_buf.f_type == OVERLAYFS_SUPER_MAGIC);
+  }
   const TempPath new_path(NewTempAbsPath());
 
   struct stat st_old = {};

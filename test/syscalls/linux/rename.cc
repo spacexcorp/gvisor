@@ -171,6 +171,11 @@ TEST(RenameTest, FileOverwritesFile) {
 
 TEST(RenameTest, DirectoryOverwritesDirectoryLinkCount) {
   auto parent1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  struct statfs statfs_buf;
+  if (statfs(parent1.path().c_str(), &statfs_buf) == 0) {
+    // Directory link counts are synthetic on overlay filesystems.
+    SKIP_IF(statfs_buf.f_type == OVERLAYFS_SUPER_MAGIC);
+  }
   EXPECT_THAT(Links(parent1.path()), IsPosixErrorOkAndHolds(2));
 
   auto parent2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());

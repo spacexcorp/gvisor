@@ -385,3 +385,37 @@ func (d *dentry) copyXattrsLocked(ctx context.Context) error {
 	}
 	return nil
 }
+
+// copyUpDescendantsLocked ensures that all descendants of d are copied up.
+//
+// Preconditions:
+// * filesystem.renameMu must be locked.
+// * d.dirMu must be locked.
+// * d.isDir().
+func (d *dentry) copyUpDescendantsLocked(ctx context.Context, ds **[]*dentry) error {
+	dirents, err := d.getDirentsLocked(ctx)
+	if err != nil {
+		return err
+	}
+	for _, dirent := range dirents {
+		if dirent.Name == "." || dirent.Name == ".." {
+			continue
+		}
+		child, err := d.fs.getChildLocked(ctx, d, dirent.Name, ds)
+		if err != nil {
+			return err
+		}
+		if err := child.copyUpLocked(ctx); err != nil {
+			return err
+		}
+		if child.isDir() {
+			child.dirMu.Lock()
+			err := child.copyUpDescendantsLocked(ctx, ds)
+			child.dirMu.Unlock()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
