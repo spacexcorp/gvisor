@@ -1024,6 +1024,31 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	return nil
 }
 
+func (d *dentry) doAllocate(ctx context.Context, offset, length uint64, allocate func() error) error {
+	d.metadataMu.Lock()
+	defer d.metadataMu.Unlock()
+
+	// Allocating a smaller size is a noop.
+	size := offset + length
+	if d.cachedMetadataAuthoritative() && size <= d.size {
+		return nil
+	}
+
+	d.handleMu.RLock()
+	err := allocate()
+	d.handleMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	d.dataMu.Lock()
+	atomic.StoreUint64(&d.size, size)
+	d.dataMu.Unlock()
+	if d.cachedMetadataAuthoritative() {
+		d.touchCMtimeLocked()
+	}
+	return nil
+}
+
 // Preconditions: d.metadataMu must be locked.
 func (d *dentry) updateFileSizeLocked(newSize uint64) {
 	d.dataMu.Lock()

@@ -196,6 +196,22 @@ TEST(TruncateTest, FtruncateNonWriteable) {
   EXPECT_THAT(ftruncate(fd.get(), 0), SyscallFailsWithErrno(EINVAL));
 }
 
+// ftruncate(2) should succeed as long as the file descriptor is writeable,
+// regardless of whether the file permissions allow writing.
+TEST(TruncateTest, FtruncateWithoutWritePermission) {
+  // Drop capabilities that allow us to override file permissions.
+  ASSERT_NO_ERRNO(SetCapability(CAP_DAC_OVERRIDE, false));
+
+  auto path = NewTempAbsPath();
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_RDWR | O_CREAT, 0444));
+
+  // In goferfs, ftruncate may be converted to a remote truncate operation that
+  // unavoidably requires write permission.
+  SKIP_IF(IsRunningOnGvisor() && !ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(path)));
+  ASSERT_THAT(ftruncate(fd.get(), 100), SyscallSucceeds());
+}
+
 TEST(TruncateTest, TruncateNonExist) {
   EXPECT_THAT(truncate("/foo/bar", 0), SyscallFailsWithErrno(ENOENT));
 }
